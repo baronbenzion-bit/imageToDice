@@ -48,6 +48,34 @@
     background: var(--ink); color: var(--bg); font: inherit; font-weight: 600; cursor: pointer;
   }
   .btn:disabled { opacity: .4; cursor: default; }
+  .btn.alt { background: transparent; color: var(--ink); border: 1px solid var(--border); margin-top: 8px; }
+  .btn.alt:hover:not(:disabled) { border-color: var(--accent); }
+
+  /* ---------- Printable build plan ---------- */
+  #print { display: none; }
+  @media print {
+    @page { size: A4; margin: 8mm; }
+    body { background: #fff; color: #000; }
+    body > *:not(#print) { display: none !important; }
+    #print { display: block; }
+    .ppage { break-after: page; page-break-after: always; text-align: center; }
+    .ppage:last-child { break-after: auto; page-break-after: auto; }
+    .ppage h2 { font-size: 18pt; margin: 0 0 2mm; }
+    .ppage h3 { font-size: 13pt; margin: 0 0 3mm; }
+    .ppage p, .ppage li { font-size: 10pt; margin: 1mm 0; }
+    .ppage ul { text-align: right; display: inline-block; margin: 2mm 0; }
+    .overview { max-width: 100%; max-height: 150mm; margin: 3mm auto; display: block; }
+    .legend { display: flex; justify-content: center; gap: 5mm; margin: 3mm 0; direction: ltr; }
+    .legend div { font-size: 10pt; font-weight: 700; }
+    .legend img { width: 11mm; height: 11mm; display: block; margin: 0 auto 1mm; }
+    table.grid { border-collapse: collapse; direction: ltr; margin: 0 auto;
+      -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+    table.grid td, table.grid th { width: 6mm; height: 6mm; padding: 0; text-align: center;
+      font-size: 3.3mm; border: 0.15mm solid #888; font-variant-numeric: tabular-nums; }
+    table.grid th { font-size: 2.2mm; font-weight: 400; color: #555; border: 0; }
+    table.grid td.r5 { border-right: 0.5mm solid #000; }
+    table.grid td.b5 { border-bottom: 0.5mm solid #000; }
+  }
   .stage { min-height: 300px; display: flex; flex-direction: column; align-items: center; justify-content: center; }
   .stage canvas { max-width: 100%; height: auto; border-radius: 6px; box-shadow: 0 4px 24px rgba(0,0,0,.18); }
   .empty { color: var(--muted); text-align: center; }
@@ -87,6 +115,8 @@
     <label class="check"><input type="checkbox" id="invert"> היפוך</label>
 
     <button class="btn" id="download" disabled>⬇ הורדת התמונה</button>
+    <button class="btn alt" id="replay" disabled>🎲 גלגלו שוב</button>
+    <button class="btn alt" id="printBtn" disabled>🖨 הדפסת תוכנית בנייה</button>
   </section>
 
   <section class="panel stage" id="stage">
@@ -95,11 +125,14 @@
     <div class="stats" id="stats"></div>
   </section>
 </main>
+<div id="print"></div>
 
 <script>
 const $ = id => document.getElementById(id);
 const out = $("out"), ctx = out.getContext("2d");
 let img = null, style = "black";
+let cur = null;     // last computed mosaic: { faces, cols, rows, s, bg, sprites }
+let animId = 0;     // requestAnimationFrame handle of the rolling animation
 
 // Pip positions for faces 1..6 on a 3x3 grid (0..2)
 const PIPS = {
@@ -115,7 +148,7 @@ function loadFile(f) {
   if (!f || !f.type.startsWith("image/")) return;
   const url = URL.createObjectURL(f);
   const im = new Image();
-  im.onload = () => { img = im; render(); };
+  im.onload = () => { img = im; render(true); };
   im.src = url;
 }
 
@@ -128,8 +161,8 @@ drop.ondrop = e => { e.preventDefault(); drop.classList.remove("over"); loadFile
 for (const id of ["cols", "bri", "con"]) {
   $(id).oninput = () => { $(id + "Out").textContent = $(id).value; render(); };
 }
-$("dither").onchange = render;
-$("invert").onchange = render;
+$("dither").onchange = () => render();
+$("invert").onchange = () => render();
 $("style").onclick = e => {
   const b = e.target.closest("button"); if (!b) return;
   style = b.dataset.v;
@@ -188,57 +221,237 @@ function toFaces({ gray, cols, rows }) {
   return faces;
 }
 
-function drawDie(x, y, s, face, body, pip) {
+function drawDie(g, x, y, s, face, body, pip) {
   const m = s * 0.06, r = s * 0.18, w = s - 2 * m;
-  ctx.fillStyle = body;
-  ctx.beginPath();
-  ctx.roundRect(x + m, y + m, w, w, r);
-  ctx.fill();
-  ctx.fillStyle = pip;
+  g.fillStyle = body;
+  g.beginPath();
+  g.roundRect(x + m, y + m, w, w, r);
+  g.fill();
+  g.fillStyle = pip;
   const pr = s * 0.085, step = w * 0.29, cx = x + s / 2, cy = y + s / 2;
   for (const [px, py] of PIPS[face]) {
-    ctx.beginPath();
-    ctx.arc(cx + (px - 1) * step, cy + (py - 1) * step, pr, 0, Math.PI * 2);
-    ctx.fill();
+    g.beginPath();
+    g.arc(cx + (px - 1) * step, cy + (py - 1) * step, pr, 0, Math.PI * 2);
+    g.fill();
   }
 }
 
-function render() {
+// Pre-render each face once (transparent background) so drawing thousands is cheap
+function makeSprites(s, body, pip) {
+  const sprites = [null];
+  for (let f = 1; f <= 6; f++) {
+    const c = document.createElement("canvas");
+    c.width = c.height = s;
+    drawDie(c.getContext("2d"), 0, 0, s, f, body, pip);
+    sprites.push(c);
+  }
+  return sprites;
+}
+
+function colors() {
+  return style === "black"
+    ? { bg: "#0e0e0e", body: "#262626", pip: "#f5f5f5" }
+    : { bg: "#d8d8d8", body: "#fbfbfb", pip: "#111111" };
+}
+
+function drawStatic() {
+  const { faces, cols, rows, s, bg, sprites } = cur;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, out.width, out.height);
+  for (let y = 0; y < rows; y++)
+    for (let x = 0; x < cols; x++)
+      ctx.drawImage(sprites[faces[y * cols + x]], x * s, y * s);
+}
+
+// Dice tumble in as a diagonal wave from the top-left corner, spinning and
+// flicking through random faces until each one lands on its final face.
+function roll() {
+  cancelAnimationFrame(animId);
+  const { faces, cols, rows, s, bg, sprites } = cur;
+  const n = cols * rows;
+  const WAVE = 2200, SPIN = 650, JITTER = 450;
+  const land = new Float32Array(n);
+  const spinDir = new Int8Array(n);
+  for (let y = 0; y < rows; y++)
+    for (let x = 0; x < cols; x++) {
+      const i = y * cols + x;
+      land[i] = SPIN + (x + y) / (cols + rows - 1) * WAVE + Math.random() * JITTER;
+      spinDir[i] = Math.random() < 0.5 ? -1 : 1;
+    }
+  const order = Array.from({ length: n }, (_, i) => i).sort((a, b) => land[a] - land[b]);
+
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, out.width, out.height);
+
+  let done = 0;  // order[0..done) have landed and been drawn for good
+  const t0 = performance.now();
+  const frame = now => {
+    const t = now - t0;
+    for (let k = done; k < n; k++) {
+      const i = order[k];
+      const start = land[i] - SPIN;
+      if (start > t) break;                 // later dice haven't started yet
+      const x = (i % cols) * s, y = Math.floor(i / cols) * s;
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.fillStyle = bg;
+      ctx.fillRect(x, y, s, s);
+      if (t >= land[i]) {
+        ctx.drawImage(sprites[faces[i]], x, y);
+        if (k === done) done++;
+        continue;
+      }
+      const p = (t - start) / SPIN;          // 0 → 1 while rolling
+      const ease = 1 - Math.pow(1 - p, 3);
+      const ang = spinDir[i] * (1 - ease) * Math.PI * 2.5;
+      // Shrink while rotated so the die never spills into its neighbours
+      const fit = 1 / (Math.abs(Math.cos(ang)) + Math.abs(Math.sin(ang)));
+      const face = 1 + ((i * 7 + Math.floor(t / 70)) % 6);
+      ctx.setTransform(fit, 0, 0, fit, x + s / 2, y + s / 2);
+      ctx.rotate(ang);
+      ctx.globalAlpha = Math.min(1, p * 3);
+      ctx.drawImage(sprites[face], -s / 2, -s / 2);
+      ctx.globalAlpha = 1;
+    }
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    if (done < n) animId = requestAnimationFrame(frame);
+    else { animId = 0; drawStatic(); }
+  };
+  animId = requestAnimationFrame(frame);
+}
+
+function render(animate = false) {
   if (!img) return;
+  cancelAnimationFrame(animId); animId = 0;
   const data = sample(+$("cols").value);
   const faces = toFaces(data);
   const { cols, rows } = data;
   const s = Math.max(8, Math.min(24, Math.floor(4000 / Math.max(cols, rows))));
   out.width = cols * s; out.height = rows * s;
+  const { bg, body, pip } = colors();
+  cur = { faces, cols, rows, s, bg, body, pip, sprites: makeSprites(s, body, pip) };
 
-  const [bg, body, pip] = style === "black"
-    ? ["#0e0e0e", "#262626", "#f5f5f5"]
-    : ["#d8d8d8", "#fbfbfb", "#111111"];
-  ctx.fillStyle = bg;
-  ctx.fillRect(0, 0, out.width, out.height);
-
-  const counts = [0,0,0,0,0,0,0];
-  for (let y = 0; y < rows; y++)
-    for (let x = 0; x < cols; x++) {
-      const f = faces[y * cols + x];
-      counts[f]++;
-      drawDie(x * s, y * s, s, f, body, pip);
-    }
+  const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  if (animate && !reduced) roll(); else drawStatic();
 
   $("empty").hidden = true;
   out.hidden = false;
-  $("download").disabled = false;
-  const total = cols * rows;
+  for (const id of ["download", "replay", "printBtn"]) $(id).disabled = false;
+  const counts = countFaces();
+  const pages = Math.ceil(cols / PAGE_COLS) * Math.ceil(rows / PAGE_ROWS);
   $("stats").innerHTML =
-    `<b>${total.toLocaleString()}</b> קוביות · ${cols}×${rows}<br>` +
+    `<b>${(cols * rows).toLocaleString()}</b> קוביות · ${cols}×${rows} · תוכנית בנייה: ${pages + 1} עמודים<br>` +
     [1,2,3,4,5,6].map(f => `${"⚀⚁⚂⚃⚄⚅"[f-1]} ${counts[f].toLocaleString()}`).join(" &nbsp; ");
 }
 
+function countFaces() {
+  const counts = [0,0,0,0,0,0,0];
+  for (const f of cur.faces) counts[f]++;
+  return counts;
+}
+
+function finishAnimation() {
+  if (animId) { cancelAnimationFrame(animId); animId = 0; drawStatic(); }
+}
+
+$("replay").onclick = () => { if (cur) roll(); };
+
 $("download").onclick = () => {
+  finishAnimation();
   const a = document.createElement("a");
   a.download = "dice-art.png";
   a.href = out.toDataURL("image/png");
   a.click();
+};
+
+// ---------- Printable build plan ----------
+// The mosaic is split into A4 sections; each section is a numbered grid that
+// says which face should point up in every cell.
+const PAGE_COLS = 30, PAGE_ROWS = 40;
+const colLetter = i => String.fromCharCode(65 + (i % 26)) + (i >= 26 ? Math.floor(i / 26) : "");
+
+function overviewImage(secX, secY) {
+  finishAnimation();
+  const { cols, rows, s } = cur;
+  const k = Math.min(1, 1800 / out.width);
+  const c = document.createElement("canvas");
+  c.width = Math.round(out.width * k); c.height = Math.round(out.height * k);
+  const g = c.getContext("2d");
+  g.drawImage(out, 0, 0, c.width, c.height);
+  const cell = s * k;
+  g.strokeStyle = "#e8890c"; g.lineWidth = Math.max(2, c.width / 400);
+  g.fillStyle = "#e8890c"; g.textAlign = "center"; g.textBaseline = "middle";
+  for (let sy = 0; sy < secY; sy++)
+    for (let sx = 0; sx < secX; sx++) {
+      const x = sx * PAGE_COLS * cell, y = sy * PAGE_ROWS * cell;
+      const w = Math.min(PAGE_COLS, cols - sx * PAGE_COLS) * cell;
+      const h = Math.min(PAGE_ROWS, rows - sy * PAGE_ROWS) * cell;
+      g.strokeRect(x, y, w, h);
+      const fs = Math.min(w, h) * 0.28;
+      g.font = `700 ${fs}px system-ui, sans-serif`;
+      g.lineWidth = fs / 8; g.strokeStyle = "#000";
+      g.strokeText(colLetter(sx) + (sy + 1), x + w / 2, y + h / 2);
+      g.fillText(colLetter(sx) + (sy + 1), x + w / 2, y + h / 2);
+      g.strokeStyle = "#e8890c"; g.lineWidth = Math.max(2, c.width / 400);
+    }
+  return c.toDataURL("image/png");
+}
+
+function buildPrint() {
+  const { faces, cols, rows } = cur;
+  const secX = Math.ceil(cols / PAGE_COLS), secY = Math.ceil(rows / PAGE_ROWS);
+  const counts = countFaces();
+  // Light shading of each cell by its brightness, so the picture shows through the numbers
+  const order = faceOrder();
+  const shade = {};
+  order.forEach((f, lvl) => { const v = Math.round(170 + lvl * 17); shade[f] = `rgb(${v},${v},${v})`; });
+  const legendSprites = makeSprites(80, cur.body, cur.pip);
+
+  let html = `<section class="ppage">
+    <h2>תוכנית בנייה — תמונה מקוביות 🎲</h2>
+    <p><b>${(cols * rows).toLocaleString()}</b> קוביות · ${cols} עמודות × ${rows} שורות · ${secX * secY} חלקים</p>
+    <img class="overview" src="${overviewImage(secX, secY)}">
+    <div class="legend">${[1,2,3,4,5,6].map(f =>
+      `<div><img src="${legendSprites[f].toDataURL()}">${f} · ${counts[f].toLocaleString()} יח׳</div>`).join("")}</div>
+    <ul>
+      <li>כל עמוד הבא הוא חלק אחד מהתמונה (A1, B1, …) לפי המפה למעלה.</li>
+      <li>המספר בכל משבצת = מספר הנקודות שצריך להיות כלפי מעלה בקובייה.</li>
+      <li>מסגרות עבות כל 5 משבצות עוזרות לא ללכת לאיבוד.</li>
+      <li>שימו לב לכיוון: ב־2, 3 ו־6 סובבו את הקובייה כמו במקרא (אלכסון משמאל־למעלה, טורים אנכיים).</li>
+      <li>צבע הקוביות: ${style === "black" ? "שחורות עם נקודות לבנות" : "לבנות עם נקודות שחורות"}.</li>
+    </ul>
+  </section>`;
+
+  for (let sy = 0; sy < secY; sy++)
+    for (let sx = 0; sx < secX; sx++) {
+      const x0 = sx * PAGE_COLS, y0 = sy * PAGE_ROWS;
+      const x1 = Math.min(cols, x0 + PAGE_COLS), y1 = Math.min(rows, y0 + PAGE_ROWS);
+      let t = `<tr><th></th>`;
+      for (let x = x0; x < x1; x++) t += `<th>${x + 1}</th>`;
+      t += `<th></th></tr>`;
+      for (let y = y0; y < y1; y++) {
+        t += `<tr><th>${y + 1}</th>`;
+        for (let x = x0; x < x1; x++) {
+          const f = faces[y * cols + x];
+          const cls = [(x - x0) % 5 === 4 ? "r5" : "", (y - y0) % 5 === 4 ? "b5" : ""].join(" ").trim();
+          t += `<td${cls ? ` class="${cls}"` : ""} style="background:${shade[f]}">${f}</td>`;
+        }
+        t += `<th>${y + 1}</th></tr>`;
+      }
+      html += `<section class="ppage">
+        <h3>חלק ${colLetter(sx)}${sy + 1} · עמודות ${x0 + 1}–${x1} · שורות ${y0 + 1}–${y1}</h3>
+        <table class="grid">${t}</table>
+      </section>`;
+    }
+  $("print").innerHTML = html;
+}
+
+$("printBtn").onclick = () => {
+  if (!cur) return;
+  buildPrint();
+  // Give the overview/legend images a moment to decode before the print dialog opens
+  setTimeout(() => window.print(), 300);
 };
 </script>
 </body>
