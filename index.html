@@ -97,6 +97,35 @@
     background: rgba(0,0,0,.6); color: #fff; pointer-events: none; }
   .tag.l { left: 8px; } .tag.r { right: 8px; }
   .empty { color: var(--muted); text-align: center; }
+
+  /* ---------- Manual crop dialog ---------- */
+  .modal { position: fixed; inset: 0; z-index: 10; background: rgba(0,0,0,.75);
+    display: flex; align-items: center; justify-content: center; padding: 16px; }
+  .modal[hidden] { display: none; }
+  .mbox { background: var(--panel); border-radius: 14px; padding: 16px; max-width: 100%;
+    display: flex; flex-direction: column; gap: 12px; align-items: center; }
+  .mbox h2 { margin: 0; font-size: 18px; }
+  .cropArea { position: relative; line-height: 0; direction: ltr; margin: 8px;
+    touch-action: none; user-select: none; -webkit-user-select: none; cursor: crosshair; }
+  .cropArea img { max-width: min(86vw, 900px); max-height: 62vh; display: block; pointer-events: none; }
+  /* Dimming lives in its own clipped layer so the handles can overhang the image edge */
+  .shadeClip { position: absolute; inset: 0; overflow: hidden; pointer-events: none; }
+  .shade { position: absolute; box-shadow: 0 0 0 9999px rgba(0,0,0,.55); }
+  .cbox { position: absolute; outline: 2px solid #fff; cursor: move;
+    background:
+      linear-gradient(rgba(255,255,255,.45), rgba(255,255,255,.45)) 33.33% 0 / 1px 100% no-repeat,
+      linear-gradient(rgba(255,255,255,.45), rgba(255,255,255,.45)) 66.66% 0 / 1px 100% no-repeat,
+      linear-gradient(rgba(255,255,255,.45), rgba(255,255,255,.45)) 0 33.33% / 100% 1px no-repeat,
+      linear-gradient(rgba(255,255,255,.45), rgba(255,255,255,.45)) 0 66.66% / 100% 1px no-repeat; }
+  .cbox i { position: absolute; width: 16px; height: 16px; background: #fff; border: 2px solid var(--accent);
+    border-radius: 3px; transform: translate(-50%, -50%); }
+  .cbox i[data-h=nw] { left: 0; top: 0; cursor: nwse-resize; }   .cbox i[data-h=n] { left: 50%; top: 0; cursor: ns-resize; }
+  .cbox i[data-h=ne] { left: 100%; top: 0; cursor: nesw-resize; } .cbox i[data-h=e] { left: 100%; top: 50%; cursor: ew-resize; }
+  .cbox i[data-h=se] { left: 100%; top: 100%; cursor: nwse-resize; } .cbox i[data-h=s] { left: 50%; top: 100%; cursor: ns-resize; }
+  .cbox i[data-h=sw] { left: 0; top: 100%; cursor: nesw-resize; } .cbox i[data-h=w] { left: 0; top: 50%; cursor: ew-resize; }
+  .cropInfo { font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .mbtns { display: flex; gap: 8px; width: 100%; }
+  .mbtns .btn { margin: 0; flex: 1; }
   .stats { margin-top: 14px; font-size: 14px; color: var(--muted); text-align: center; line-height: 1.7; }
   .stats b { color: var(--ink); }
 </style>
@@ -131,6 +160,7 @@
       <button data-v="crop" class="on" title="חותך את השוליים כדי לשמור על פרופורציות">✂ חיתוך</button>
       <button data-v="stretch" title="מותח/מכווץ את התמונה לגודל החדש">↔ מתיחה</button>
     </div>
+    <button class="btn alt" id="cropBtn" disabled>✂ חיתוך ידני</button>
 
     <label>בהירות <output id="briOut">0</output></label>
     <input type="range" id="bri" min="-100" max="100" value="0">
@@ -166,6 +196,33 @@
 </main>
 <div id="print"></div>
 
+<div class="modal" id="cropModal" hidden>
+  <div class="mbox">
+    <h2>✂ חיתוך התמונה</h2>
+    <div class="cropArea" id="cropArea">
+      <img id="cropImg" alt="">
+      <div class="shadeClip"><div class="shade" id="shade"></div></div>
+      <div class="cbox" id="cbox">
+        <i data-h="nw"></i><i data-h="n"></i><i data-h="ne"></i><i data-h="e"></i>
+        <i data-h="se"></i><i data-h="s"></i><i data-h="sw"></i><i data-h="w"></i>
+      </div>
+    </div>
+    <div class="seg" id="cropRatio" style="width:100%">
+      <button data-r="free" class="on">חופשי</button>
+      <button data-r="1">1:1</button>
+      <button data-r="0.75">3:4</button>
+      <button data-r="1.3333">4:3</button>
+      <button data-r="1.7778">16:9</button>
+    </div>
+    <div class="cropInfo" id="cropInfo"></div>
+    <div class="mbtns">
+      <button class="btn" id="cropOk">אישור</button>
+      <button class="btn alt" id="cropReset">איפוס</button>
+      <button class="btn alt" id="cropCancel">ביטול</button>
+    </div>
+  </div>
+</div>
+
 <script>
 const $ = id => document.getElementById(id);
 const out = $("out"), ctx = out.getContext("2d");
@@ -187,7 +244,7 @@ function loadFile(f) {
   if (!f || !f.type.startsWith("image/")) return;
   const url = URL.createObjectURL(f);
   const im = new Image();
-  im.onload = () => { img = im; syncRows(); render(true); };
+  im.onload = () => { img = im; crop = null; syncRows(); render(true); };
   im.src = url;
 }
 
@@ -211,7 +268,7 @@ function setRows(r) {
 }
 function syncRows() {
   const cols = +$("cols").value;
-  if (ratio === "orig" && img) setRows(cols * img.height / img.width);
+  if (ratio === "orig" && img) { const [, , W, H] = baseRect(); setRows(cols * H / W); }
   else if (typeof ratio === "number") setRows(cols / ratio);
 }
 function selectRatio(r) {
@@ -234,12 +291,143 @@ $("fit").onclick = e => {
 };
 
 // Which part of the photo to use: centre-crop to the grid's ratio, or the whole photo (stretched)
+// The part of the photo the user kept with manual crop (whole photo if none)
+let crop = null;   // [x, y, w, h] in image pixels
+const baseRect = () => crop || [0, 0, img.width, img.height];
+
 function sourceRect(cols, rows) {
-  const W = img.width, H = img.height, a = cols / rows;
-  if (fit === "stretch" || Math.abs(W / H - a) < 1e-3) return [0, 0, W, H];
-  if (W / H > a) { const sw = H * a; return [(W - sw) / 2, 0, sw, H]; }
-  const sh = W / a; return [0, (H - sh) / 2, W, sh];
+  const [bx, by, W, H] = baseRect(), a = cols / rows;
+  if (fit === "stretch" || Math.abs(W / H - a) < 1e-3) return [bx, by, W, H];
+  if (W / H > a) { const sw = H * a; return [bx + (W - sw) / 2, by, sw, H]; }
+  const sh = W / a; return [bx, by + (H - sh) / 2, W, sh];
 }
+
+// ---------- Manual crop ----------
+// The box is kept in image pixels; corners and edges resize it, the inside
+// moves it, and dragging outside it draws a new one.
+const cropModal = $("cropModal"), cropArea = $("cropArea"), cbox = $("cbox");
+let box = null, cropAspect = null, drag = null;
+
+function cropScale() { return $("cropImg").clientWidth / img.width; }
+function drawBox() {
+  const k = cropScale();
+  const st = { left: box.x * k + "px", top: box.y * k + "px", width: box.w * k + "px", height: box.h * k + "px" };
+  Object.assign(cbox.style, st);
+  Object.assign($("shade").style, st);
+  $("cropInfo").textContent = `${Math.round(box.w)} × ${Math.round(box.h)} פיקסלים`;
+}
+const minSide = () => Math.max(8, 0.03 * Math.min(img.width, img.height));
+
+// Resize from a fixed anchor point toward the pointer (corners and new boxes)
+function fromAnchor(ax, ay, px, py) {
+  const W = img.width, H = img.height, sx = px >= ax ? 1 : -1, sy = py >= ay ? 1 : -1;
+  const maxW = sx > 0 ? W - ax : ax, maxH = sy > 0 ? H - ay : ay;
+  let w = Math.abs(px - ax), h = Math.abs(py - ay);
+  if (cropAspect) {
+    const a = cropAspect;
+    w = Math.min(Math.max(w, h * a, minSide()), maxW, maxH * a); h = w / a;
+  } else {
+    w = Math.min(Math.max(w, minSide()), maxW); h = Math.min(Math.max(h, minSide()), maxH);
+  }
+  box = { x: sx > 0 ? ax : ax - w, y: sy > 0 ? ay : ay - h, w, h };
+}
+
+// Resize one edge; with a locked ratio the other side grows around its centre
+function fromEdge(edge, px, py, s) {
+  const W = img.width, H = img.height, a = cropAspect;
+  if (edge === "e" || edge === "w") {
+    const ax = edge === "e" ? s.x : s.x + s.w, cy = s.y + s.h / 2;
+    let w = Math.max(minSide(), edge === "e" ? px - ax : ax - px);
+    w = Math.min(w, edge === "e" ? W - ax : ax);
+    let h = s.h;
+    if (a) { w = Math.min(w, 2 * Math.min(cy, H - cy) * a); h = w / a; }
+    box = { x: edge === "e" ? ax : ax - w, y: a ? cy - h / 2 : s.y, w, h };
+  } else {
+    const ay = edge === "s" ? s.y : s.y + s.h, cx = s.x + s.w / 2;
+    let h = Math.max(minSide(), edge === "s" ? py - ay : ay - py);
+    h = Math.min(h, edge === "s" ? H - ay : ay);
+    let w = s.w;
+    if (a) { h = Math.min(h, 2 * Math.min(cx, W - cx) / a); w = h * a; }
+    box = { x: a ? cx - w / 2 : s.x, y: edge === "s" ? ay : ay - h, w, h };
+  }
+}
+
+// Reshape the box to a new ratio around its centre, as large as still fits
+function applyAspect() {
+  if (!cropAspect) return;
+  const W = img.width, H = img.height, a = cropAspect;
+  const cx = box.x + box.w / 2, cy = box.y + box.h / 2;
+  let w = Math.min(Math.max(box.w, box.h * a), W, H * a), h = w / a;
+  box = { x: Math.min(W - w, Math.max(0, cx - w / 2)), y: Math.min(H - h, Math.max(0, cy - h / 2)), w, h };
+}
+
+function toImage(e) {
+  const r = $("cropImg").getBoundingClientRect(), k = cropScale();
+  return [Math.min(img.width, Math.max(0, (e.clientX - r.left) / k)),
+          Math.min(img.height, Math.max(0, (e.clientY - r.top) / k))];
+}
+
+cropArea.onpointerdown = e => {
+  e.preventDefault();
+  cropArea.setPointerCapture(e.pointerId);
+  const [px, py] = toImage(e), s = { ...box }, h = e.target.dataset.h;
+  if (h && h.length === 2) {           // corner: anchor the opposite corner
+    drag = { type: "anchor", ax: h.includes("w") ? s.x + s.w : s.x, ay: h.includes("n") ? s.y + s.h : s.y };
+  } else if (h) {
+    drag = { type: "edge", edge: h, s };
+  } else if (e.target === cbox) {
+    drag = { type: "move", px, py, s };
+  } else {                             // outside the box: start a new one here
+    drag = { type: "anchor", ax: px, ay: py };
+    fromAnchor(px, py, px, py); drawBox();
+  }
+};
+cropArea.onpointermove = e => {
+  if (!drag) return;
+  const [px, py] = toImage(e);
+  if (drag.type === "anchor") fromAnchor(drag.ax, drag.ay, px, py);
+  else if (drag.type === "edge") fromEdge(drag.edge, px, py, drag.s);
+  else {
+    const { s } = drag;
+    box = { ...s,
+      x: Math.min(img.width - s.w, Math.max(0, s.x + px - drag.px)),
+      y: Math.min(img.height - s.h, Math.max(0, s.y + py - drag.py)) };
+  }
+  drawBox();
+};
+cropArea.onpointerup = cropArea.onpointercancel = () => { drag = null; };
+
+$("cropRatio").onclick = e => {
+  const b = e.target.closest("button"); if (!b) return;
+  cropAspect = b.dataset.r === "free" ? null : +b.dataset.r;
+  for (const x of $("cropRatio").children) x.classList.toggle("on", x === b);
+  applyAspect(); drawBox();
+};
+
+function openCrop() {
+  if (!img) return;
+  finishAnimation();
+  const [x, y, w, h] = baseRect();
+  box = { x, y, w, h };
+  cropModal.hidden = false;
+  const ci = $("cropImg");
+  if (ci.src !== img.src) { ci.src = img.src; ci.onload = drawBox; } else drawBox();
+}
+const closeCrop = () => { cropModal.hidden = true; drag = null; };
+
+$("cropBtn").onclick = openCrop;
+$("cropCancel").onclick = closeCrop;
+$("cropReset").onclick = () => { box = { x: 0, y: 0, w: img.width, h: img.height }; applyAspect(); drawBox(); };
+$("cropOk").onclick = () => {
+  const full = box.w >= img.width - 1 && box.h >= img.height - 1;
+  crop = full ? null : [box.x, box.y, box.w, box.h].map(Math.round);
+  closeCrop();
+  selectRatio("orig");   // the dice grid follows the shape of the crop
+  syncRows(); render(true);
+};
+cropModal.onclick = e => { if (e.target === cropModal) closeCrop(); };
+addEventListener("keydown", e => { if (e.key === "Escape" && !cropModal.hidden) closeCrop(); });
+addEventListener("resize", () => { if (!cropModal.hidden) drawBox(); });
 
 // ---------- Before/after comparison ----------
 const cmp = $("cmp");
@@ -444,7 +632,7 @@ function render(animate = false) {
 
   $("empty").hidden = true;
   out.hidden = false;
-  for (const id of ["download", "replay", "printBtn"]) $(id).disabled = false;
+  for (const id of ["download", "replay", "printBtn", "cropBtn"]) $(id).disabled = false;
   const counts = countFaces();
   const pages = Math.ceil(cols / PAGE_COLS) * Math.ceil(rows / PAGE_ROWS);
   $("stats").innerHTML =
